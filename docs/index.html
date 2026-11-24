@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>chipdial</title>
+<meta name="description" content="One chiptune song with a dial from chill to intense. The synth is written in wac.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0d0b14; --panel: #17142a; --ink: #e8e4ff; --dim: #6c6690; --line: #2c2747;
+    --cool: #46c8d8; --warm: #ff5a7a; --mid: #c28cff;
+    --t: 0.3;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font-family: 'Press Start 2P', ui-monospace, monospace; font-size: 12px; line-height: 1.6;
+    display: flex; align-items: center; justify-content: center; padding: 16px;
+    image-rendering: pixelated;
+  }
+  body::after { /* scanlines */
+    content: ''; position: fixed; inset: 0; pointer-events: none;
+    background: repeating-linear-gradient(to bottom, rgba(0,0,0,0.18) 0 1px, transparent 1px 3px);
+  }
+  main { width: 100%; max-width: 720px; }
+  header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 20px; gap: 12px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: 2px; }
+  h1 span { color: var(--accent, var(--mid)); }
+  .mood { color: var(--accent, var(--mid)); font-size: 12px; text-transform: uppercase; }
+  .panel { background: var(--panel); border: 4px solid var(--line); padding: 16px; box-shadow: 6px 6px 0 #000; }
+  canvas { display: block; width: 100%; height: 160px; background: #08070e; border: 4px solid var(--line); }
+  .steps { display: grid; grid-template-columns: repeat(16, 1fr); gap: 4px; margin: 12px 0 0; }
+  .steps i { height: 8px; background: var(--line); }
+  .steps i:nth-child(4n+1) { background: #3a3460; }
+  .steps i.on { background: var(--accent, var(--mid)); }
+  .layers { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; margin-top: 16px; font-size: 8px; text-align: center; color: var(--dim); }
+  .layers div::before { content: ''; display: block; height: 12px; margin-bottom: 6px; background: var(--accent, var(--mid)); opacity: var(--lvl, 0); border: 2px solid var(--line); }
+  .dial { margin-top: 24px; }
+  input[type=range] { -webkit-appearance: none; appearance: none; width: 100%; height: 32px; background: transparent; margin: 0; cursor: pointer; }
+  input[type=range]:focus-visible { outline: 4px dashed var(--accent, var(--mid)); outline-offset: 4px; }
+  input[type=range]::-webkit-slider-runnable-track { height: 16px; background: linear-gradient(90deg, var(--cool), var(--mid), var(--warm)); border: 4px solid #000; }
+  input[type=range]::-moz-range-track { height: 8px; background: linear-gradient(90deg, var(--cool), var(--mid), var(--warm)); border: 4px solid #000; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 24px; height: 32px; margin-top: -12px; background: var(--ink); border: 4px solid #000; border-radius: 0; }
+  input[type=range]::-moz-range-thumb { width: 16px; height: 24px; background: var(--ink); border: 4px solid #000; border-radius: 0; }
+  .ticks { display: flex; justify-content: space-between; color: var(--dim); font-size: 8px; margin-top: 10px; }
+  .controls { display: flex; gap: 16px; align-items: center; margin-top: 24px; flex-wrap: wrap; }
+  button { font: inherit; color: #000; background: var(--accent, var(--mid)); border: 4px solid #000; padding: 12px 18px; cursor: pointer; box-shadow: 4px 4px 0 #000; }
+  button:active { transform: translate(4px, 4px); box-shadow: none; }
+  button:focus-visible { outline: 4px dashed var(--ink); outline-offset: 2px; }
+  .vol { display: flex; align-items: center; gap: 10px; color: var(--dim); font-size: 8px; flex: 1; min-width: 160px; }
+  .vol input { height: 20px; }
+  .vol input::-webkit-slider-runnable-track { height: 8px; background: var(--line); border: 2px solid #000; }
+  .vol input::-webkit-slider-thumb { width: 12px; height: 20px; margin-top: -8px; }
+  footer { margin-top: 18px; color: var(--dim); font-size: 8px; line-height: 2; }
+  footer a { color: var(--ink); }
+  .err { color: var(--warm); font-size: 10px; margin-top: 12px; min-height: 1em; }
+</style>
+</head>
+<body>
+<main>
+  <header><h1>chip<span>dial</span></h1><div class="mood" id="mood">focus</div></header>
+  <div class="panel">
+    <canvas id="scope" width="680" height="160"></canvas>
+    <div class="steps" id="steps"></div>
+    <div class="layers" id="layers"></div>
+    <div class="dial">
+      <input type="range" id="dial" min="0" max="1000" value="300" aria-label="Intensity, from chill to intense">
+      <div class="ticks"><span>chill</span><span>intense</span></div>
+    </div>
+    <div class="controls">
+      <button id="play">&#9654; play</button>
+      <label class="vol">vol <input type="range" id="vol" min="0" max="100" value="70" aria-label="Volume"></label>
+    </div>
+    <div class="err" id="err"></div>
+  </div>
+  <footer>
+    space: play/pause &middot; arrow keys: dial<br>
+    One song. Every voice in it is synthesised in <a href="https://github.com/voltrevo/wac">wac</a> and runs in an AudioWorklet.
+    <a href="https://github.com/botreevo/chipdial">source</a>
+  </footer>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
