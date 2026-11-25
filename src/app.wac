@@ -195,10 +195,10 @@ void draw(Element scope, u8[] bins, i32[] lo, i32[] hi, i32[] rgb, u8[] px) {
   scope.pixels(W, H, px);
 }
 
-string CSS() {
-  string face = "@font-face { font-family: 'Press Start 2P'; font-style: normal; font-weight: 400; font-display: swap; "
-      + "src: url(data:font/woff2;base64," + FONT_WOFF2_BASE64() + ") format('woff2'); }\n";
-  return face + """
+static string CSS =
+  "@font-face { font-family: 'Press Start 2P'; font-style: normal; font-weight: 400; font-display: swap; "
+      + "src: url(data:font/woff2;base64," + FONT_WOFF2_BASE64 + ") format('woff2'); }\n"
+  + """
     :root {
       --bg: #0d0b14; --panel: #17142a; --ink: #e8e4ff; --dim: #6c6690; --line: #2c2747;
       --cool: #46c8d8; --warm: #ff5a7a; --mid: #c28cff;
@@ -246,7 +246,6 @@ string CSS() {
     footer { margin-top: 18px; color: var(--dim); font-size: 8px; line-height: 2; }
     footer a { color: var(--ink); }
     """;
-}
 
 Element child(Element parent, string tag, string cls) {
   Element e = parent.append(tag);
@@ -258,7 +257,7 @@ export async i32 main(Page page) {
   page.title("chipdial");
   page.describe("One chiptune song with a dial from chill to intense. All of it, synth included, is wac.");
   Element root = page.root();
-  root.append("style").text(CSS());
+  root.append("style").text(CSS);
   Element mainEl = root.append("main");
   // **Keys reach the page through it**: a program's authority starts at its root, inside <body>, and with nothing
   // focused a key goes to <body>. So the page keeps focus inside itself — at the start, and after a click anywhere

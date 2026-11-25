@@ -15,7 +15,7 @@ i32 sextet(u8 c) {
 export string test_the_embedded_font_is_the_file(Sys sys) {
   u8[]? file = flatten(sys.files().readFile("fonts/press-start-2p.woff2").wait()).ok();
   if (file is null) { return "fonts/press-start-2p.woff2 is not readable"; }
-  u8[] text = FONT_WOFF2_BASE64().toBytes();
+  u8[] text = FONT_WOFF2_BASE64.toBytes();
   i32 bits = 0;
   i32 have = 0;
   i32 n = 0;
