@@ -23,7 +23,8 @@ is kept in the address (`#t=420`), so a reload or a link comes back to the same 
 - [`src/song.wac`](src/song.wac): the song. `render` fills a block of stereo samples from the dial's value.
 - [`src/app.wac`](src/app.wac): the page. A quarter of a second at a time it renders a chunk into a stereo sound and
   plays it after the one before (`Sound.playAfter`, which starts it on the sample the last one ends on, by the
-  audio's own clock), then forgets it (`Sound.forget`), keeping about 0.7 s queued. The screen is drawn with
+  audio's own clock), then forgets it (`Sound.forget`), keeping about 0.7 s queued — 3 s while the tab is hidden. It is
+  fed from the program's own timer, not from frames, which a browser stops in a hidden tab. The screen is drawn with
   `pixels()` from a snapshot each chunk leaves — its waveform, its step, each layer's loudest — shown when that chunk
   is heard, not when it was rendered.
 - [`test/song_test.wac`](test/song_test.wac): the song is finite, never past full scale, louder as the dial rises,

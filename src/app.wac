@@ -6,6 +6,10 @@
 // clock) and forgotten (`Sound.forget`), so the page never holds more than the little that is queued. The dial moves
 // the song's target; the song glides to it over about a second, so a chunk queued ahead is never a jump.
 //
+// **The sound is fed by a timer, the screen by frames.** A browser stops a hidden tab's frames (they are for painting),
+// so a song fed from them fell silent the moment the tab was hidden. The program's own timers run in its worker, which
+// a browser does not stop, so `feed` keeps the queue full whether the tab is seen or not.
+//
 // **The screen is drawn from what is heard**, not what was just rendered: each chunk leaves a snapshot — the step, how
 // loud each layer is, a stretch of its waveform — stamped with when it will play, and a frame shows the latest one
 // whose time has come.
@@ -17,7 +21,10 @@ import { Song, create, intensity, jump, levels, render, step } from "./song.wac"
 static i32 RATE = 44100;
 static i32 CHUNK = 11025;          // a quarter of a second
 static f64 CHUNK_MS = 250.0;
-static f64 AHEAD_MS = 700.0;       // how much is queued: enough to ride out a busy main thread
+// How much is queued. Seen, a little, so the dial is heard soon after it moves. Hidden, more: a browser runs a hidden
+// tab's document less often, which is where each chunk is handed to the audio, and nobody is moving the dial.
+static f64 AHEAD_SEEN_MS = 700.0;
+static f64 AHEAD_HIDDEN_MS = 3000.0;
 static i32 W = 128;
 static i32 H = 72;
 
@@ -37,6 +44,7 @@ struct App {
   bool playing;
   Voice? last;
   f64 end;
+  f64 ahead;
   Vec<Voice> queued;
   Vec<Snap> snaps;
 }
@@ -70,7 +78,7 @@ string mood(f64 t) {
 /** Render, queue and forget chunks until `AHEAD_MS` is queued. */
 void topUp(Page page, App app, f64 now) {
   if (app.end < now) { app.end = now; app.last = null; }
-  while (app.end - now < AHEAD_MS) {
+  while (app.end - now < app.ahead) {
     render(app.song, app.target, CHUNK);
     f64[] l = f64[].filled(CHUNK, 0.0);
     f64[] r = f64[].filled(CHUNK, 0.0);
@@ -93,6 +101,14 @@ void topUp(Page page, App app, f64 now) {
     app.last = v;
     app.queued.push(v);
     while (app.queued.len() > 8) { app.queued.remove(0); }
+  }
+}
+
+/** Keep the queue topped up, on the program's own timer, for as long as the page lives. */
+async void feed(Page page, App app) {
+  while (true) {
+    f64 now = await page.sleep(100);
+    if (app.playing) { topUp(page, app, now); }
   }
 }
 
@@ -255,7 +271,8 @@ export async i32 main(Page page) {
   jump(song, start);
   Vec<Voice> queued = Vec.create();
   Vec<Snap> snaps = Vec.create();
-  App app = App(song, start, 0.49, false, null, 0.0, queued, snaps);
+  App app = App(song, start, 0.49, false, null, 0.0, page.visible() ? AHEAD_SEEN_MS : AHEAD_HIDDEN_MS, queued, snaps);
+  page.onVisible((bool seen) => { app.ahead = seen ? AHEAD_SEEN_MS : AHEAD_HIDDEN_MS; });
   moodEl.text(mood(start));
 
   dial.on("input", Listen.none(), (ElementEvent e) => {
@@ -274,6 +291,7 @@ export async i32 main(Page page) {
     } else {
       page.resumeAudio();
       app.playing = true;
+      topUp(page, app, page.now());
       play.text("❚❚ pause");
     }
   };
@@ -284,9 +302,9 @@ export async i32 main(Page page) {
   Snap? shown = null;
   string said = "";
   string painted = "";
+  feed(page, app);
   while (true) {
     f64 now = await page.nextFrame();
-    if (app.playing) { topUp(page, app, now); }
     // The newest snapshot whose chunk has begun to play; older ones go.
     while (app.snaps.len() > 0 && app.snaps.get(0).at <= now) {
       shown = app.snaps.get(0);
