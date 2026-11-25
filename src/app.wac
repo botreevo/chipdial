@@ -1,44 +1,50 @@
-// chipdial: one chiptune song with a dial from chill to intense, as a page — the synth (`song.wac`), the dial, and the
-// screen, all of it wac.
+// chipdial: one chiptune song with a dial from chill to intense, as a page — the synth (`song.wac`), the spectrum
+// (`spectrum.wac`), the screen and the page, all of it wac.
 //
-// **The sound is made as it is heard.** A quarter of a second at a time the song renders into a stereo sound, which is
-// played after the one before it (`Sound.playAfter`: it starts on the sample that one ends on, by the audio's own
-// clock) and forgotten (`Sound.forget`), so the page never holds more than the little that is queued. The dial moves
-// the song's target; the song glides to it over about a second, so a chunk queued ahead is never a jump.
+// **The sound is made as it is heard.** A tenth of a second at a time the song renders into a stereo sound, played
+// after the one before it (`Sound.playAfter`: it starts on the sample that one ends on, by the audio's own clock) and
+// forgotten (`Sound.forget`). About 0.3 s is queued while the page is seen, so the dial is heard soon after it moves,
+// and 3 s while it is hidden, when the browser runs the page's document less often and nobody is moving the dial.
+// Volume is a fade on what is queued, so it changes at once.
 //
-// **The sound is fed by a timer, the screen by frames.** A browser stops a hidden tab's frames (they are for painting),
-// so a song fed from them fell silent the moment the tab was hidden. The program's own timers run in its worker, which
-// a browser does not stop, so `feed` keeps the queue full whether the tab is seen or not.
+// **The sound is fed by a timer, the screen by frames.** A browser stops a hidden tab's frames, so the queue is kept
+// full by the program's own timer (`feed`), which runs in its worker.
 //
-// **The screen is drawn from what is heard**, not what was just rendered: each chunk leaves a snapshot — the step, how
-// loud each layer is, a stretch of its waveform — stamped with when it will play, and a frame shows the latest one
-// whose time has come.
+// **The screen is drawn from what is heard**, not what was just rendered: the spectrum is taken every 1024 samples as
+// they are rendered and stamped with when they will play, and a frame shows the newest whose time has come.
 
 import { Element, ElementEvent, Listen, Page, Sound, Voice } from "web";
-import { Vec } from "core";
-import { Song, create, intensity, jump, levels, render, step } from "./song.wac";
+import { Vec, math } from "core";
+import { Song, create, intensity, jump, render, step } from "./song.wac";
+import { Analyser, analyser, feed as hear, spectrum } from "./spectrum.wac";
+import { FONT_WOFF2_BASE64 } from "./font.wac";
 
 static i32 RATE = 44100;
-static i32 CHUNK = 11025;          // a quarter of a second
-static f64 CHUNK_MS = 250.0;
-// How much is queued. Seen, a little, so the dial is heard soon after it moves. Hidden, more: a browser runs a hidden
-// tab's document less often, which is where each chunk is handed to the audio, and nobody is moving the dial.
-static f64 AHEAD_SEEN_MS = 700.0;
+static i32 CHUNK = 4410;              // a tenth of a second
+static f64 CHUNK_MS = 100.0;
+static f64 AHEAD_SEEN_MS = 300.0;
 static f64 AHEAD_HIDDEN_MS = 3000.0;
-static i32 W = 128;
-static i32 H = 72;
+static i32 HOP = 1024;                // a spectrum every this many samples: about 43 a second
+static i32 W = 680;
+static i32 H = 160;
 
-/** What one chunk looks like, for when it is heard. */
-struct Snap {
+/** A spectrum, and when its last sample is heard. */
+struct Spec {
+  f64 at;
+  u8[] bins;
+}
+
+/** The step a chunk starts on, and when. */
+struct Beat {
   f64 at;
   i32 step;
   f64 t;
-  f64[] levels;
-  f64[] wave;
 }
 
 struct App {
   Song song;
+  Analyser an;
+  i32 sinceSpec;
   f64 target;
   f64 volume;
   bool playing;
@@ -46,10 +52,10 @@ struct App {
   f64 end;
   f64 ahead;
   Vec<Voice> queued;
-  Vec<Snap> snaps;
+  Vec<Spec> specs;
+  Vec<Beat> beats;
 }
 
-/** The whole number in `s`'s digits. */
 i32 whole(string s) {
   u8[] b = s.toBytes();
   i32 v = 0;
@@ -58,12 +64,12 @@ i32 whole(string s) {
 }
 
 /** The dial as the page's address keeps it, `#t=420`: so a reload, or a link, comes back to the same place. */
-f64 dialFrom(string where) {
+i32 dialFrom(string where) {
   if (where.len() > 2 && where.slice(0, 2) == "t=") {
     i32 v = whole(where.slice(2, where.len()));
-    return (v > 1000 ? 1000 : v) as f64 / 1000.0;
+    return v > 1000 ? 1000 : v;
   }
-  return 0.3;
+  return 300;
 }
 
 string mood(f64 t) {
@@ -75,39 +81,59 @@ string mood(f64 t) {
   return "blaze";
 }
 
-/** Render, queue and forget chunks until `AHEAD_MS` is queued. */
+f64 ss(f64 a, f64 b, f64 x) {
+  f64 u = (x - a) / (b - a);
+  if (u < 0.0) { u = 0.0; }
+  if (u > 1.0) { u = 1.0; }
+  return u * u * (3.0 - 2.0 * u);
+}
+
+/** How far in each layer is at `t`, as `song.wac` brings them in: pad, arp, bass, hats, kick, snare, lead. */
+f64 layer(i32 k, f64 t) {
+  if (k == 0) { return 1.0; }
+  if (k == 1) { return ss(0.1, 0.28, t); }
+  if (k == 2) { return ss(0.25, 0.35, t); }
+  if (k == 3) { return ss(0.38, 0.48, t); }
+  if (k == 4) { return ss(0.45, 0.55, t); }
+  if (k == 5) { return ss(0.6, 0.7, t); }
+  return ss(0.7, 0.85, t);
+}
+
+/** Render, queue and forget chunks until `ahead` is queued; analyse what was rendered as it goes. */
 void topUp(Page page, App app, f64 now) {
   if (app.end < now) { app.end = now; app.last = null; }
   while (app.end - now < app.ahead) {
+    f64 startsAt = app.end;
+    app.beats.push(Beat(startsAt, step(app.song) + 1, intensity(app.song)));
     render(app.song, app.target, CHUNK);
     f64[] l = f64[].filled(CHUNK, 0.0);
     f64[] r = f64[].filled(CHUNK, 0.0);
-    f64[] wave = f64[].filled(W, 0.0);
     for (i32 i = 0; i < CHUNK; i++) {
-      l[i] = app.song.outL[i] * app.volume;
-      r[i] = app.song.outR[i] * app.volume;
+      l[i] = app.song.outL[i];
+      r[i] = app.song.outR[i];
+      hear(app.an, (l[i] + r[i]) * 0.5);
+      app.sinceSpec = app.sinceSpec + 1;
+      if (app.sinceSpec == HOP) {
+        app.sinceSpec = 0;
+        u8[] bins = u8[].filled(1024, 0 as u8);
+        spectrum(app.an, bins);
+        app.specs.push(Spec(startsAt + ((i + 1) as f64) * 1000.0 / (RATE as f64), bins));
+      }
     }
-    for (i32 x = 0; x < W; x++) {
-      i32 i = (x * (CHUNK / 4)) / W;
-      wave[x] = (app.song.outL[i] + app.song.outR[i]) * 0.5;
-    }
-    f64[] lv = f64[].filled(7, 0.0);
-    levels(app.song, lv);
     Sound s = page.soundStereo(l, r, RATE);
-    Voice v = app.last is null ? s.play(1.0) : s.playAfter(app.last!, 1.0);
+    Voice v = app.last is null ? s.play(app.volume) : s.playAfter(app.last!, app.volume);
     s.forget();
-    app.snaps.push(Snap(app.end, step(app.song), intensity(app.song), lv, wave));
     app.end = app.end + CHUNK_MS;
     app.last = v;
     app.queued.push(v);
-    while (app.queued.len() > 8) { app.queued.remove(0); }
+    while (app.queued.len() > 40) { app.queued.remove(0); }
   }
 }
 
 /** Keep the queue topped up, on the program's own timer, for as long as the page lives. */
 async void feed(Page page, App app) {
   while (true) {
-    f64 now = await page.sleep(100);
+    f64 now = await page.sleep(25);
     if (app.playing) { topUp(page, app, now); }
   }
 }
@@ -117,7 +143,8 @@ void stopAll(App app) {
   app.queued.clear();
   app.last = null;
   app.end = 0.0;
-  app.snaps.clear();
+  app.specs.clear();
+  app.beats.clear();
 }
 
 /** The colour the dial is at: teal, through violet, to pink. */
@@ -133,81 +160,98 @@ i32[] accent(f64 t) {
   return out;
 }
 
-void dot(u8[] px, i32 x, i32 y, i32[] rgb, i32 alpha) {
-  if (x < 0 || y < 0 || x >= W || y >= H) { return; }
-  i32 o = (y * W + x) * 4;
-  px[o] = ((rgb[0] * alpha) / 255) as@ u8;
-  px[o + 1] = ((rgb[1] * alpha) / 255) as@ u8;
-  px[o + 2] = ((rgb[2] * alpha) / 255) as@ u8;
-  px[o + 3] = 255 as u8;
+void rect(u8[] px, i32 x0, i32 y0, i32 w, i32 h, i32[] rgb) {
+  for (i32 y = y0; y < y0 + h; y++) {
+    if (y < 0 || y >= H) { continue; }
+    for (i32 x = x0; x < x0 + w; x++) {
+      if (x < 0 || x >= W) { continue; }
+      i32 o = (y * W + x) * 4;
+      px[o] = rgb[0] as@ u8;
+      px[o + 1] = rgb[1] as@ u8;
+      px[o + 2] = rgb[2] as@ u8;
+      px[o + 3] = 255 as u8;
+    }
+  }
 }
 
-/** One frame: the waveform, the sixteen steps, and a bar per layer, from the snapshot being heard. */
-void draw(Element screen, Snap? snap, f64 t, u8[] px) {
-  for (i32 i = 0; i < W * H; i++) {
-    px[i * 4] = 8 as u8;
-    px[i * 4 + 1] = 7 as u8;
-    px[i * 4 + 2] = 14 as u8;
-    px[i * 4 + 3] = 255 as u8;
-  }
-  i32[] rgb = accent(t);
-  i32[] dim = [44, 39, 71];
-  if (snap is not null) {
-    Snap s = snap!;
-    // The waveform, across the top.
-    for (i32 x = 0; x < W; x++) {
-      i32 y = 16 - ((s.wave[x] * 30.0) as~ i32);
-      dot(px, x, y, rgb, 255);
-      dot(px, x, y + 1, rgb, 120);
-    }
-    // The sixteen steps of the bar, the one playing lit.
-    for (i32 k = 0; k < 16; k++) {
-      bool on = s.step % 16 == k;
-      for (i32 x = k * 8 + 1; x < k * 8 + 7; x++) {
-        for (i32 y = 36; y < 39; y++) { dot(px, x, y, on ? rgb : dim, 255); }
-      }
-    }
-    // A bar per layer: pad, arp, bass, hats, kick, snare, lead.
-    for (i32 k = 0; k < 7; k++) {
-      f64 v = s.levels[k];
-      if (v > 1.0) { v = 1.0; }
-      i32 tall = (v * 26.0) as~ i32;
-      i32 x0 = 4 + k * 18;
-      for (i32 y = 0; y < 26; y++) {
-        bool lit = y < tall;
-        for (i32 x = x0; x < x0 + 14; x++) { if (y % 2 == 0) { dot(px, x, 70 - y, lit ? rgb : dim, lit ? 255 : 140); } }
-      }
+/**
+ * The spectrum as chipdial first drew it: 34 columns over a logarithmic range of bins, each the loudest bin in its
+ * range, stacked in 10-pixel blocks — the top four rows in red, the rest in the dial's colour.
+ */
+void draw(Element scope, u8[] bins, i32[] lo, i32[] hi, i32[] rgb, u8[] px) {
+  rect(px, 0, 0, W, H, [8, 7, 14]);
+  i32 cols = 34;
+  i32 cw = W / cols;
+  i32 block = 10;
+  i32 rows = H / block;
+  for (i32 c = 0; c < cols; c++) {
+    i32 m = 0;
+    for (i32 i = lo[c]; i < hi[c] && i < 1024; i++) { if ((bins[i] as i32) > m) { m = bins[i] as i32; } }
+    i32 n = ((m as f64) / 255.0 * (rows as f64) + 0.5) as~ i32;
+    for (i32 row = 0; row < n; row++) {
+      rect(px, c * cw + 2, H - (row + 1) * block + 2, cw - 4, block - 4, row > rows - 4 ? [255, 90, 122] : rgb);
     }
   }
-  screen.pixels(W, H, px);
+  scope.pixels(W, H, px);
 }
 
 string CSS() {
-  return """
-    :root { --bg: #0d0b14; --panel: #17142a; --ink: #e8e4ff; --dim: #6c6690; --line: #2c2747; --accent: #c28cff; }
+  string face = "@font-face { font-family: 'Press Start 2P'; font-style: normal; font-weight: 400; font-display: swap; "
+      + "src: url(data:font/woff2;base64," + FONT_WOFF2_BASE64() + ") format('woff2'); }\n";
+  return face + """
+    :root {
+      --bg: #0d0b14; --panel: #17142a; --ink: #e8e4ff; --dim: #6c6690; --line: #2c2747;
+      --cool: #46c8d8; --warm: #ff5a7a; --mid: #c28cff;
+    }
     * { box-sizing: border-box; }
-    html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--ink); }
-    body { font: 13px/1.6 ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace; display: flex;
-           justify-content: center; padding: 16px; }
+    html, body { margin: 0; height: 100%; }
+    body {
+      background: var(--bg); color: var(--ink);
+      font-family: 'Press Start 2P', ui-monospace, monospace; font-size: 12px; line-height: 1.6;
+      display: flex; align-items: center; justify-content: center; padding: 16px;
+      image-rendering: pixelated;
+    }
+    body::after { content: ''; position: fixed; inset: 0; pointer-events: none;
+      background: repeating-linear-gradient(to bottom, rgba(0,0,0,0.18) 0 1px, transparent 1px 3px); }
     main { width: 100%; max-width: 720px; }
-    header { display: flex; justify-content: space-between; align-items: baseline; margin: 8px 0 16px; }
-    h1 { font-size: 22px; letter-spacing: 3px; margin: 0; }
-    h1 span, #mood { color: var(--accent); }
-    #mood { text-transform: uppercase; letter-spacing: 2px; }
+    main:focus { outline: none; }
+    header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 20px; gap: 12px; }
+    h1 { font-size: 20px; margin: 0; letter-spacing: 2px; }
+    h1 span { color: var(--accent, var(--mid)); }
+    .mood { color: var(--accent, var(--mid)); font-size: 12px; text-transform: uppercase; }
     .panel { background: var(--panel); border: 4px solid var(--line); padding: 16px; box-shadow: 6px 6px 0 #000; }
-    canvas { display: block; width: 100%; aspect-ratio: 128 / 72; image-rendering: pixelated; border: 4px solid var(--line); background: #08070e; }
-    .layers { display: grid; grid-template-columns: repeat(7, 1fr); color: var(--dim); font-size: 10px; text-align: center; margin-top: 4px; }
-    input[type=range] { width: 100%; accent-color: var(--accent); margin: 20px 0 4px; height: 28px; cursor: pointer; }
-    .ticks { display: flex; justify-content: space-between; color: var(--dim); font-size: 11px; }
-    .row { display: flex; gap: 16px; align-items: center; margin-top: 20px; flex-wrap: wrap; }
-    button { font: inherit; font-weight: bold; color: #000; background: var(--accent); border: 4px solid #000;
-             padding: 10px 18px; cursor: pointer; box-shadow: 4px 4px 0 #000; }
+    canvas { display: block; width: 100%; height: 160px; background: #08070e; border: 4px solid var(--line); }
+    .steps { display: grid; grid-template-columns: repeat(16, 1fr); gap: 4px; margin: 12px 0 0; }
+    .steps i { height: 8px; background: var(--line); }
+    .steps i:nth-child(4n+1) { background: #3a3460; }
+    .steps i.on { background: var(--accent, var(--mid)); }
+    .layers { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; margin-top: 16px; font-size: 8px; text-align: center; color: var(--dim); }
+    .layers div::before { content: ''; display: block; height: 12px; margin-bottom: 6px; background: var(--accent, var(--mid)); opacity: var(--lvl, 0); border: 2px solid var(--line); }
+    .dial { margin-top: 24px; }
+    input[type=range] { -webkit-appearance: none; appearance: none; width: 100%; height: 32px; background: transparent; margin: 0; cursor: pointer; }
+    input[type=range]:focus-visible { outline: 4px dashed var(--accent, var(--mid)); outline-offset: 4px; }
+    input[type=range]::-webkit-slider-runnable-track { height: 16px; background: linear-gradient(90deg, var(--cool), var(--mid), var(--warm)); border: 4px solid #000; }
+    input[type=range]::-moz-range-track { height: 8px; background: linear-gradient(90deg, var(--cool), var(--mid), var(--warm)); border: 4px solid #000; }
+    input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 24px; height: 32px; margin-top: -12px; background: var(--ink); border: 4px solid #000; border-radius: 0; }
+    input[type=range]::-moz-range-thumb { width: 16px; height: 24px; background: var(--ink); border: 4px solid #000; border-radius: 0; }
+    .ticks { display: flex; justify-content: space-between; color: var(--dim); font-size: 8px; margin-top: 10px; }
+    .controls { display: flex; gap: 16px; align-items: center; margin-top: 24px; flex-wrap: wrap; }
+    button { font: inherit; color: #000; background: var(--accent, var(--mid)); border: 4px solid #000; padding: 12px 18px; cursor: pointer; box-shadow: 4px 4px 0 #000; }
     button:active { transform: translate(4px, 4px); box-shadow: none; }
-    .vol { flex: 1; min-width: 160px; display: flex; align-items: center; gap: 10px; color: var(--dim); }
-    .vol input { margin: 0; }
-    footer { color: var(--dim); font-size: 11px; margin-top: 16px; }
+    button:focus-visible { outline: 4px dashed var(--ink); outline-offset: 2px; }
+    .vol { display: flex; align-items: center; gap: 10px; color: var(--dim); font-size: 8px; flex: 1; min-width: 160px; }
+    .vol input { height: 20px; }
+    .vol input::-webkit-slider-runnable-track { height: 8px; background: var(--line); border: 2px solid #000; }
+    .vol input::-webkit-slider-thumb { width: 12px; height: 20px; margin-top: -8px; }
+    footer { margin-top: 18px; color: var(--dim); font-size: 8px; line-height: 2; }
     footer a { color: var(--ink); }
     """;
+}
+
+Element child(Element parent, string tag, string cls) {
+  Element e = parent.append(tag);
+  if (cls != "") { e.attr("class", cls); }
+  return e;
 }
 
 export async i32 main(Page page) {
@@ -216,38 +260,48 @@ export async i32 main(Page page) {
   Element root = page.root();
   root.append("style").text(CSS());
   Element mainEl = root.append("main");
+  // **Keys reach the page through it**: a program's authority starts at its root, inside <body>, and with nothing
+  // focused a key goes to <body>. So the page keeps focus inside itself — at the start, and after a click anywhere
+  // in it but the controls, which keep their own.
+  mainEl.attr("tabindex", "-1");
   Element head = mainEl.append("header");
   Element h1 = head.append("h1");
   h1.appendText("chip");
   h1.append("span").text("dial");
-  Element moodEl = head.append("div");
+  Element moodEl = child(head, "div", "mood");
   moodEl.attr("id", "mood");
-  Element panel = mainEl.append("div");
-  panel.attr("class", "panel");
-  Element screen = panel.append("canvas");
-  screen.attr("id", "screen");
-  Element names = panel.append("div");
-  names.attr("class", "layers");
-  string[] layerNames = ["pad", "arp", "bass", "hats", "kick", "snare", "lead"];
-  for (i32 i = 0; i < 7; i++) { names.append("span").text(layerNames[i]); }
-  Element dial = panel.append("input");
+  Element panel = child(mainEl, "div", "panel");
+  Element scope = panel.append("canvas");
+  scope.attr("id", "scope");
+  Element stepsEl = child(panel, "div", "steps");
+  stepsEl.attr("id", "steps");
+  Vec<Element> lamps = Vec.create();
+  for (i32 i = 0; i < 16; i++) { lamps.push(stepsEl.append("i")); }
+  Element layersEl = child(panel, "div", "layers");
+  layersEl.attr("id", "layers");
+  string[] names = ["pad", "arp", "bass", "hats", "kick", "snare", "lead"];
+  Vec<Element> lights = Vec.create();
+  for (i32 i = 0; i < 7; i++) {
+    Element d = layersEl.append("div");
+    d.text(names[i]);
+    lights.push(d);
+  }
+  Element dialBox = child(panel, "div", "dial");
+  Element dial = dialBox.append("input");
   dial.attr("type", "range");
   dial.attr("id", "dial");
   dial.attr("min", "0");
   dial.attr("max", "1000");
   dial.attr("aria-label", "Intensity, from chill to intense");
-  Element ticks = panel.append("div");
-  ticks.attr("class", "ticks");
+  Element ticks = child(dialBox, "div", "ticks");
   ticks.append("span").text("chill");
   ticks.append("span").text("intense");
-  Element row = panel.append("div");
-  row.attr("class", "row");
-  Element play = row.append("button");
+  Element controls = child(panel, "div", "controls");
+  Element play = controls.append("button");
   play.attr("id", "play");
   play.text("▶ play");
-  Element volBox = row.append("label");
-  volBox.attr("class", "vol");
-  volBox.appendText("vol");
+  Element volBox = child(controls, "label", "vol");
+  volBox.appendText("vol ");
   Element vol = volBox.append("input");
   vol.attr("type", "range");
   vol.attr("id", "vol");
@@ -256,32 +310,44 @@ export async i32 main(Page page) {
   vol.attr("value", "70");
   vol.attr("aria-label", "Volume");
   Element foot = mainEl.append("footer");
-  foot.appendText("space: play / pause · the dial takes the arrow keys · ");
-  Element src = foot.append("a");
-  src.attr("href", "https://github.com/botreevo/chipdial");
-  src.text("source");
-  foot.appendText(" — the synth, the screen and this page are all ");
+  foot.appendText("space: play/pause · arrow keys: dial");
+  foot.append("br");
+  foot.appendText("One song. Its synth, its spectrum and this page are all ");
   Element wacLink = foot.append("a");
   wacLink.attr("href", "https://github.com/voltrevo/wac");
   wacLink.text("wac");
+  foot.appendText(". ");
+  Element src = foot.append("a");
+  src.attr("href", "https://github.com/botreevo/chipdial");
+  src.text("source");
 
-  f64 start = dialFrom(page.location());
-  dial.attr("value", "\{(start * 1000.0) as~ i32}");
+  i32 startDial = dialFrom(page.location());
+  dial.attr("value", "\{startDial}");
+  f64 start = (startDial as f64) / 1000.0;
   Song song = create(RATE as f64, CHUNK);
   jump(song, start);
   Vec<Voice> queued = Vec.create();
-  Vec<Snap> snaps = Vec.create();
-  App app = App(song, start, 0.49, false, null, 0.0, page.visible() ? AHEAD_SEEN_MS : AHEAD_HIDDEN_MS, queued, snaps);
+  Vec<Spec> specs = Vec.create();
+  Vec<Beat> beats = Vec.create();
+  App app = App(song, analyser(), 0, start, 0.49, false, null, 0.0,
+                page.visible() ? AHEAD_SEEN_MS : AHEAD_HIDDEN_MS, queued, specs, beats);
   page.onVisible((bool seen) => { app.ahead = seen ? AHEAD_SEEN_MS : AHEAD_HIDDEN_MS; });
-  moodEl.text(mood(start));
 
-  dial.on("input", Listen.none(), (ElementEvent e) => {
-    app.target = (whole(e.value) as f64) / 1000.0;
-    page.go("t=\{whole(e.value)}", false);
-  });
+  fn<void(i32)> setDial = (i32 v) => {
+    i32 c = v < 0 ? 0 : (v > 1000 ? 1000 : v);
+    app.target = (c as f64) / 1000.0;
+    page.go("t=\{c}", false);
+  };
+  // Where the dial is, kept here as it moves: an input's value is the document's, and asking for it waits on it.
+  i32 dialAt = startDial;
+  dial.on("input", Listen.none(), (ElementEvent e) => { dialAt = whole(e.value); setDial(dialAt); });
   vol.on("input", Listen.none(), (ElementEvent e) => {
     f64 v = (whole(e.value) as f64) / 100.0;
     app.volume = v * v;
+    // What is queued is turned too, so the change is heard now rather than when the queue has played. (The loop's
+    // variable is `q`, not `i`: in a lambda made inside an async function, a loop reusing the name of one in that
+    // function never ends — a wac compiler bug, reduced in the commit that introduced this comment.)
+    for (i32 q = 0; q < app.queued.len(); q++) { app.queued.get(q).fade(app.volume, 30); }
   });
   fn<void()> toggle = () => {
     if (app.playing) {
@@ -296,28 +362,70 @@ export async i32 main(Page page) {
     }
   };
   play.on("click", Listen.none(), (ElementEvent e) => { toggle(); });
-  root.on("keydown", Listen.keys(" "), (ElementEvent e) => { if (e.value == " ") { toggle(); } });
+  root.on("pointerdown", Listen.none(), (ElementEvent e) => {
+    if (e.target.id != dial.id && e.target.id != vol.id && e.target.id != play.id) { mainEl.focus(); }
+  });
+  root.on("keydown", Listen.keys(" ArrowLeft ArrowRight ArrowUp ArrowDown"), (ElementEvent e) => {
+    // Space on the play button is the button's own click as well: it toggles there, once.
+    if (e.value == " ") { if (e.target.id != play.id) { toggle(); } return; }
+    i32 by = e.value == "ArrowRight" || e.value == "ArrowUp" ? 20 : (e.value == "ArrowLeft" || e.value == "ArrowDown" ? -20 : 0);
+    if (by == 0) { return; }
+    dialAt = dialAt + by;
+    if (dialAt < 0) { dialAt = 0; }
+    if (dialAt > 1000) { dialAt = 1000; }
+    dial.prop("value", "\{dialAt}");
+    setDial(dialAt);
+  });
 
+  // The columns' ranges of bins, as the first version had them: 2 * 400^(c/34) to the next.
+  i32[] lo = i32[].filled(34, 0);
+  i32[] hi = i32[].filled(34, 0);
+  for (i32 c = 0; c < 34; c++) {
+    lo[c] = (2.0 * math.pow(400.0, (c as f64) / 34.0)) as~ i32;
+    i32 h = (2.0 * math.pow(400.0, ((c + 1) as f64) / 34.0)) as~ i32;
+    hi[c] = h > lo[c] ? h : lo[c] + 1;
+  }
   u8[] px = u8[].filled(W * H * 4, 0 as u8);
-  Snap? shown = null;
+  u8[] quiet = u8[].filled(1024, 0 as u8);
+  u8[]? shown = null;
+  i32 lit = -1;
   string said = "";
   string painted = "";
+  string[] levels = ["", "", "", "", "", "", ""];
+  f64 t = start;
   feed(page, app);
+  mainEl.focus();
+  draw(scope, quiet, lo, hi, accent(t), px);
   while (true) {
     f64 now = await page.nextFrame();
-    // The newest snapshot whose chunk has begun to play; older ones go.
-    while (app.snaps.len() > 0 && app.snaps.get(0).at <= now) {
-      shown = app.snaps.get(0);
-      app.snaps.remove(0);
+    // The newest spectrum, and the newest step, whose time has come.
+    u8[]? next = null;
+    while (app.specs.len() > 0 && app.specs.get(0).at <= now) { next = app.specs.get(0).bins; app.specs.remove(0); }
+    while (app.beats.len() > 0 && app.beats.get(0).at <= now) {
+      Beat b = app.beats.get(0);
+      t = b.t;
+      if (b.step % 16 != lit) {
+        if (lit >= 0) { lamps.get(lit).attr("class", null); }
+        lit = b.step % 16;
+        lamps.get(lit).attr("class", "on");
+      }
+      app.beats.remove(0);
     }
-    f64 t = shown is not null && app.playing ? shown!.t : app.target;
+    if (!app.playing) {
+      t = app.target;
+      if (lit >= 0) { lamps.get(lit).attr("class", null); lit = -1; }
+    }
     string m = mood(t);
     if (m != said) { moodEl.text(m); said = m; }
-    // The page's accent follows the dial, as the screen does: set when it has moved enough to see.
     i32[] c = accent(t);
     string colour = "--accent: rgb(\{c[0]}, \{c[1]}, \{c[2]})";
     if (colour != painted) { mainEl.attr("style", colour); painted = colour; }
-    draw(screen, app.playing ? shown : null, t, px);
+    for (i32 k = 0; k < 7; k++) {
+      string l = "--lvl: \{(((0.15 + 0.85 * layer(k, t)) * 20.0) as~ i32) as f64 / 20.0}";
+      if (l != levels[k]) { lights.get(k).attr("style", l); levels[k] = l; }
+    }
+    if (next is not null) { draw(scope, next!, lo, hi, c, px); shown = next; }
+    else if (!app.playing && shown is not null) { draw(scope, quiet, lo, hi, c, px); shown = null; }
   }
   return 0;
 }

@@ -15,18 +15,22 @@ Turning the dial doesn't switch between tracks. Each feature of the song depends
 | timbre | filters open, pulse waves narrow, the bass picks up a square |
 | tempo | glides from 82 to 128 BPM |
 
-The intensity follows the dial over about a second, so a sudden move becomes a short build-up or wind-down. The dial
+The intensity follows the dial with a time constant of 0.4 s, so a sudden move becomes a short build-up or wind-down
+rather than a cut. The dial
 is kept in the address (`#t=420`), so a reload or a link comes back to the same place.
 
 ## How it's made
 
 - [`src/song.wac`](src/song.wac): the song. `render` fills a block of stereo samples from the dial's value.
-- [`src/app.wac`](src/app.wac): the page. A quarter of a second at a time it renders a chunk into a stereo sound and
+- [`src/app.wac`](src/app.wac): the page. A tenth of a second at a time it renders a chunk into a stereo sound and
   plays it after the one before (`Sound.playAfter`, which starts it on the sample the last one ends on, by the
-  audio's own clock), then forgets it (`Sound.forget`), keeping about 0.7 s queued — 3 s while the tab is hidden. It is
-  fed from the program's own timer, not from frames, which a browser stops in a hidden tab. The screen is drawn with
-  `pixels()` from a snapshot each chunk leaves — its waveform, its step, each layer's loudest — shown when that chunk
-  is heard, not when it was rendered.
+  audio's own clock), then forgets it (`Sound.forget`), keeping about 0.3 s queued — 3 s while the tab is hidden. It is
+  fed from the program's own timer, not from frames, which a browser stops in a hidden tab. Volume fades what is
+  already queued, so it changes at once.
+- [`src/spectrum.wac`](src/spectrum.wac): the spectrum the screen draws, made the way the browser's AnalyserNode makes
+  one (2048-point FFT under a Blackman window, smoothed 0.75, -100 to -30 dB), since the page has no AnalyserNode of
+  its own sound to ask. Against Chromium's on the same signal: 1016 of 1024 bins identical, the rest within 1.
+- [`src/font.wac`](src/font.wac): Press Start 2P, embedded (OFL, [`fonts/`](fonts/)).
 - [`test/song_test.wac`](test/song_test.wac): the song is finite, never past full scale, louder as the dial rises,
   and its layers come in where they should.
 

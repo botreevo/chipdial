@@ -144,7 +144,7 @@ f64 osc(Part v, f64 rate) {
 export Song create(f64 rate, i32 block) {
   Song s = Song { };
   s.rate = rate;
-  s.tCoef = 1.0 - math.exp(0.0 - 1.0 / (1.2 * rate));
+  s.tCoef = 1.0 - math.exp(0.0 - 1.0 / (0.4 * rate));
   s.freqs = f64[].filled(128, 0.0);
   for (i32 n = 0; n < 128; n++) { s.freqs[n] = 440.0 * math.pow(2.0, ((n - 69) as f64) / 12.0); }
   s.padPh = f64[].filled(8, 0.0);

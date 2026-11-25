@@ -1,0 +1,37 @@
+// src/font.wac is fonts/press-start-2p.woff2, byte for byte: decoded here and compared with the file.
+import { Sys } from "std";
+import { flatten } from "core";
+import { FONT_WOFF2_BASE64 } from "../src/font.wac";
+
+i32 sextet(u8 c) {
+  if (c >= 'A' && c <= 'Z') { return (c - 'A') as i32; }
+  if (c >= 'a' && c <= 'z') { return (c - 'a') as i32 + 26; }
+  if (c >= '0' && c <= '9') { return (c - '0') as i32 + 52; }
+  if (c == '+') { return 62; }
+  if (c == '/') { return 63; }
+  return -1;
+}
+
+export string test_the_embedded_font_is_the_file(Sys sys) {
+  u8[]? file = flatten(sys.files().readFile("fonts/press-start-2p.woff2").wait()).ok();
+  if (file is null) { return "fonts/press-start-2p.woff2 is not readable"; }
+  u8[] text = FONT_WOFF2_BASE64().toBytes();
+  i32 bits = 0;
+  i32 have = 0;
+  i32 n = 0;
+  u8[] out = u8[].filled(text.len(), 0 as u8);
+  for (i32 i = 0; i < text.len(); i++) {
+    i32 v = sextet(text[i]);
+    if (v < 0) { continue; }
+    bits = ((bits << 6) | v) & 0xFFFFFF;
+    have = have + 6;
+    if (have >= 8) {
+      have = have - 8;
+      out[n] = ((bits >> have) & 255) as@ u8;
+      n = n + 1;
+    }
+  }
+  if (n != file!.len()) { return "the embedded font is \{n} bytes, the file \{file!.len()}"; }
+  for (i32 i = 0; i < n; i++) { if (out[i] != file![i]) { return "they differ at byte \{i}"; } }
+  return "";
+}

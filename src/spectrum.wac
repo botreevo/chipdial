@@ -1,0 +1,104 @@
+// A spectrum the way the browser's AnalyserNode makes one, in wac: the page has no AnalyserNode to ask — its sound is
+// made by this program, and the browser only plays it — so the screen is drawn from the same samples, analysed here.
+//
+// Web Audio's own recipe (the AnalyserNode section of the spec), with the settings chipdial's first version used: the
+// last 2048 samples under a Blackman window, a 2048-point FFT, each bin's magnitude over N, smoothed against the last
+// by 0.75, in decibels, and mapped -100 dB..-30 dB onto 0..255 — `getByteFrequencyData`.
+import { math } from "core";
+
+static i32 N = 2048;
+static i32 BINS = 1024;
+
+export struct Analyser {
+  f64[] ring;
+  i32 pos = 0;
+  f64[] window;
+  f64[] re;
+  f64[] im;
+  f64[] cosT;
+  f64[] sinT;
+  i32[] rev;
+  f64[] smoothed;
+}
+
+static f64 PI = 3.141592653589793;
+
+/** sin, by Taylor series after reducing to [-pi/2, pi/2] — only ever used to make the tables, so accuracy over speed. */
+export f64 sine(f64 x) {
+  f64 tau = 2.0 * PI;
+  x = x - (x / tau).floor() * tau;               // [0, 2pi)
+  if (x > PI) { x = x - tau; }                    // (-pi, pi]
+  if (x > PI / 2.0) { x = PI - x; }
+  if (x < 0.0 - PI / 2.0) { x = 0.0 - PI - x; }
+  f64 term = x;
+  f64 sum = x;
+  for (i32 k = 1; k < 12; k++) {
+    term = 0.0 - term * x * x / ((2 * k) as f64) / ((2 * k + 1) as f64);
+    sum = sum + term;
+  }
+  return sum;
+}
+
+f64 cosine(f64 x) { return sine(x + PI / 2.0); }
+
+export Analyser analyser() {
+  f64[] w = f64[].filled(N, 0.0);
+  for (i32 i = 0; i < N; i++) {
+    f64 u = 2.0 * PI * (i as f64) / (N as f64);
+    w[i] = 0.42 - 0.5 * cosine(u) + 0.08 * cosine(2.0 * u);     // Blackman, alpha 0.16
+  }
+  f64[] c = f64[].filled(N / 2, 0.0);
+  f64[] s = f64[].filled(N / 2, 0.0);
+  for (i32 k = 0; k < N / 2; k++) {
+    c[k] = cosine(2.0 * PI * (k as f64) / (N as f64));
+    s[k] = 0.0 - sine(2.0 * PI * (k as f64) / (N as f64));
+  }
+  i32[] rev = i32[].filled(N, 0);
+  i32 bits = 11;
+  for (i32 i = 0; i < N; i++) {
+    i32 r = 0;
+    for (i32 b = 0; b < bits; b++) { if ((i & (1 << b)) != 0) { r = r | (1 << (bits - 1 - b)); } }
+    rev[i] = r;
+  }
+  return Analyser(f64[].filled(N, 0.0), 0, w, f64[].filled(N, 0.0), f64[].filled(N, 0.0), c, s, rev, f64[].filled(BINS, 0.0));
+}
+
+/** One more sample of what is heard. */
+export void feed(Analyser a, f64 x) {
+  a.ring[a.pos] = x;
+  a.pos = (a.pos + 1) % N;
+}
+
+/** The spectrum of the last N samples fed, as `getByteFrequencyData` gives it, into `out` (1024 bytes). */
+export void spectrum(Analyser a, u8[] out) {
+  for (i32 i = 0; i < N; i++) {
+    i32 j = a.rev[i];
+    a.re[j] = a.ring[(a.pos + i) % N] * a.window[i];
+    a.im[j] = 0.0;
+  }
+  for (i32 size = 2; size <= N; size = size * 2) {
+    i32 half = size / 2;
+    i32 step = N / size;
+    for (i32 start = 0; start < N; start = start + size) {
+      for (i32 k = 0; k < half; k++) {
+        f64 wr = a.cosT[k * step];
+        f64 wi = a.sinT[k * step];
+        i32 p = start + k;
+        i32 q = p + half;
+        f64 tr = a.re[q] * wr - a.im[q] * wi;
+        f64 ti = a.re[q] * wi + a.im[q] * wr;
+        a.re[q] = a.re[p] - tr;
+        a.im[q] = a.im[p] - ti;
+        a.re[p] = a.re[p] + tr;
+        a.im[p] = a.im[p] + ti;
+      }
+    }
+  }
+  for (i32 k = 0; k < BINS; k++) {
+    f64 mag = (a.re[k] * a.re[k] + a.im[k] * a.im[k]).sqrt() / (N as f64);
+    a.smoothed[k] = 0.75 * a.smoothed[k] + 0.25 * mag;
+    f64 db = a.smoothed[k] > 0.0 ? 20.0 * math.log10(a.smoothed[k]) : 0.0 - 1000.0;
+    f64 v = 255.0 * (db + 100.0) / 70.0;
+    out[k] = (v < 0.0 ? 0 : (v > 255.0 ? 255 : (v as~ i32))) as@ u8;
+  }
+}
