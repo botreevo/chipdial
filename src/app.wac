@@ -1,0 +1,305 @@
+// chipdial: one chiptune song with a dial from chill to intense, as a page — the synth (`song.wac`), the dial, and the
+// screen, all of it wac.
+//
+// **The sound is made as it is heard.** A quarter of a second at a time the song renders into a stereo sound, which is
+// played after the one before it (`Sound.playAfter`: it starts on the sample that one ends on, by the audio's own
+// clock) and forgotten (`Sound.forget`), so the page never holds more than the little that is queued. The dial moves
+// the song's target; the song glides to it over about a second, so a chunk queued ahead is never a jump.
+//
+// **The screen is drawn from what is heard**, not what was just rendered: each chunk leaves a snapshot — the step, how
+// loud each layer is, a stretch of its waveform — stamped with when it will play, and a frame shows the latest one
+// whose time has come.
+
+import { Element, ElementEvent, Listen, Page, Sound, Voice } from "web";
+import { Vec } from "core";
+import { Song, create, intensity, jump, levels, render, step } from "./song.wac";
+
+static i32 RATE = 44100;
+static i32 CHUNK = 11025;          // a quarter of a second
+static f64 CHUNK_MS = 250.0;
+static f64 AHEAD_MS = 700.0;       // how much is queued: enough to ride out a busy main thread
+static i32 W = 128;
+static i32 H = 72;
+
+/** What one chunk looks like, for when it is heard. */
+struct Snap {
+  f64 at;
+  i32 step;
+  f64 t;
+  f64[] levels;
+  f64[] wave;
+}
+
+struct App {
+  Song song;
+  f64 target;
+  f64 volume;
+  bool playing;
+  Voice? last;
+  f64 end;
+  Vec<Voice> queued;
+  Vec<Snap> snaps;
+}
+
+/** The whole number in `s`'s digits. */
+i32 whole(string s) {
+  u8[] b = s.toBytes();
+  i32 v = 0;
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] >= '0' && b[i] <= '9') { v = v * 10 + ((b[i] - '0') as i32); } }
+  return v;
+}
+
+/** The dial as the page's address keeps it, `#t=420`: so a reload, or a link, comes back to the same place. */
+f64 dialFrom(string where) {
+  if (where.len() > 2 && where.slice(0, 2) == "t=") {
+    i32 v = whole(where.slice(2, where.len()));
+    return (v > 1000 ? 1000 : v) as f64 / 1000.0;
+  }
+  return 0.3;
+}
+
+string mood(f64 t) {
+  if (t < 0.1) { return "drift"; }
+  if (t < 0.3) { return "calm"; }
+  if (t < 0.5) { return "focus"; }
+  if (t < 0.7) { return "flow"; }
+  if (t < 0.88) { return "drive"; }
+  return "blaze";
+}
+
+/** Render, queue and forget chunks until `AHEAD_MS` is queued. */
+void topUp(Page page, App app, f64 now) {
+  if (app.end < now) { app.end = now; app.last = null; }
+  while (app.end - now < AHEAD_MS) {
+    render(app.song, app.target, CHUNK);
+    f64[] l = f64[].filled(CHUNK, 0.0);
+    f64[] r = f64[].filled(CHUNK, 0.0);
+    f64[] wave = f64[].filled(W, 0.0);
+    for (i32 i = 0; i < CHUNK; i++) {
+      l[i] = app.song.outL[i] * app.volume;
+      r[i] = app.song.outR[i] * app.volume;
+    }
+    for (i32 x = 0; x < W; x++) {
+      i32 i = (x * (CHUNK / 4)) / W;
+      wave[x] = (app.song.outL[i] + app.song.outR[i]) * 0.5;
+    }
+    f64[] lv = f64[].filled(7, 0.0);
+    levels(app.song, lv);
+    Sound s = page.soundStereo(l, r, RATE);
+    Voice v = app.last is null ? s.play(1.0) : s.playAfter(app.last!, 1.0);
+    s.forget();
+    app.snaps.push(Snap(app.end, step(app.song), intensity(app.song), lv, wave));
+    app.end = app.end + CHUNK_MS;
+    app.last = v;
+    app.queued.push(v);
+    while (app.queued.len() > 8) { app.queued.remove(0); }
+  }
+}
+
+void stopAll(App app) {
+  for (i32 i = 0; i < app.queued.len(); i++) { app.queued.get(i).stop(); }
+  app.queued.clear();
+  app.last = null;
+  app.end = 0.0;
+  app.snaps.clear();
+}
+
+/** The colour the dial is at: teal, through violet, to pink. */
+i32[] accent(f64 t) {
+  i32[] a = [70, 200, 216];
+  i32[] b = [194, 140, 255];
+  i32[] c = [255, 90, 122];
+  f64 u = t < 0.5 ? t * 2.0 : t * 2.0 - 1.0;
+  i32[] from = t < 0.5 ? a : b;
+  i32[] to = t < 0.5 ? b : c;
+  i32[] out = [0, 0, 0];
+  for (i32 i = 0; i < 3; i++) { out[i] = from[i] + ((((to[i] - from[i]) as f64) * u) as~ i32); }
+  return out;
+}
+
+void dot(u8[] px, i32 x, i32 y, i32[] rgb, i32 alpha) {
+  if (x < 0 || y < 0 || x >= W || y >= H) { return; }
+  i32 o = (y * W + x) * 4;
+  px[o] = ((rgb[0] * alpha) / 255) as@ u8;
+  px[o + 1] = ((rgb[1] * alpha) / 255) as@ u8;
+  px[o + 2] = ((rgb[2] * alpha) / 255) as@ u8;
+  px[o + 3] = 255 as u8;
+}
+
+/** One frame: the waveform, the sixteen steps, and a bar per layer, from the snapshot being heard. */
+void draw(Element screen, Snap? snap, f64 t, u8[] px) {
+  for (i32 i = 0; i < W * H; i++) {
+    px[i * 4] = 8 as u8;
+    px[i * 4 + 1] = 7 as u8;
+    px[i * 4 + 2] = 14 as u8;
+    px[i * 4 + 3] = 255 as u8;
+  }
+  i32[] rgb = accent(t);
+  i32[] dim = [44, 39, 71];
+  if (snap is not null) {
+    Snap s = snap!;
+    // The waveform, across the top.
+    for (i32 x = 0; x < W; x++) {
+      i32 y = 16 - ((s.wave[x] * 30.0) as~ i32);
+      dot(px, x, y, rgb, 255);
+      dot(px, x, y + 1, rgb, 120);
+    }
+    // The sixteen steps of the bar, the one playing lit.
+    for (i32 k = 0; k < 16; k++) {
+      bool on = s.step % 16 == k;
+      for (i32 x = k * 8 + 1; x < k * 8 + 7; x++) {
+        for (i32 y = 36; y < 39; y++) { dot(px, x, y, on ? rgb : dim, 255); }
+      }
+    }
+    // A bar per layer: pad, arp, bass, hats, kick, snare, lead.
+    for (i32 k = 0; k < 7; k++) {
+      f64 v = s.levels[k];
+      if (v > 1.0) { v = 1.0; }
+      i32 tall = (v * 26.0) as~ i32;
+      i32 x0 = 4 + k * 18;
+      for (i32 y = 0; y < 26; y++) {
+        bool lit = y < tall;
+        for (i32 x = x0; x < x0 + 14; x++) { if (y % 2 == 0) { dot(px, x, 70 - y, lit ? rgb : dim, lit ? 255 : 140); } }
+      }
+    }
+  }
+  screen.pixels(W, H, px);
+}
+
+string CSS() {
+  return """
+    :root { --bg: #0d0b14; --panel: #17142a; --ink: #e8e4ff; --dim: #6c6690; --line: #2c2747; --accent: #c28cff; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--ink); }
+    body { font: 13px/1.6 ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace; display: flex;
+           justify-content: center; padding: 16px; }
+    main { width: 100%; max-width: 720px; }
+    header { display: flex; justify-content: space-between; align-items: baseline; margin: 8px 0 16px; }
+    h1 { font-size: 22px; letter-spacing: 3px; margin: 0; }
+    h1 span, #mood { color: var(--accent); }
+    #mood { text-transform: uppercase; letter-spacing: 2px; }
+    .panel { background: var(--panel); border: 4px solid var(--line); padding: 16px; box-shadow: 6px 6px 0 #000; }
+    canvas { display: block; width: 100%; aspect-ratio: 128 / 72; image-rendering: pixelated; border: 4px solid var(--line); background: #08070e; }
+    .layers { display: grid; grid-template-columns: repeat(7, 1fr); color: var(--dim); font-size: 10px; text-align: center; margin-top: 4px; }
+    input[type=range] { width: 100%; accent-color: var(--accent); margin: 20px 0 4px; height: 28px; cursor: pointer; }
+    .ticks { display: flex; justify-content: space-between; color: var(--dim); font-size: 11px; }
+    .row { display: flex; gap: 16px; align-items: center; margin-top: 20px; flex-wrap: wrap; }
+    button { font: inherit; font-weight: bold; color: #000; background: var(--accent); border: 4px solid #000;
+             padding: 10px 18px; cursor: pointer; box-shadow: 4px 4px 0 #000; }
+    button:active { transform: translate(4px, 4px); box-shadow: none; }
+    .vol { flex: 1; min-width: 160px; display: flex; align-items: center; gap: 10px; color: var(--dim); }
+    .vol input { margin: 0; }
+    footer { color: var(--dim); font-size: 11px; margin-top: 16px; }
+    footer a { color: var(--ink); }
+    """;
+}
+
+export async i32 main(Page page) {
+  page.title("chipdial");
+  page.describe("One chiptune song with a dial from chill to intense. All of it, synth included, is wac.");
+  Element root = page.root();
+  root.append("style").text(CSS());
+  Element mainEl = root.append("main");
+  Element head = mainEl.append("header");
+  Element h1 = head.append("h1");
+  h1.appendText("chip");
+  h1.append("span").text("dial");
+  Element moodEl = head.append("div");
+  moodEl.attr("id", "mood");
+  Element panel = mainEl.append("div");
+  panel.attr("class", "panel");
+  Element screen = panel.append("canvas");
+  screen.attr("id", "screen");
+  Element names = panel.append("div");
+  names.attr("class", "layers");
+  string[] layerNames = ["pad", "arp", "bass", "hats", "kick", "snare", "lead"];
+  for (i32 i = 0; i < 7; i++) { names.append("span").text(layerNames[i]); }
+  Element dial = panel.append("input");
+  dial.attr("type", "range");
+  dial.attr("id", "dial");
+  dial.attr("min", "0");
+  dial.attr("max", "1000");
+  dial.attr("aria-label", "Intensity, from chill to intense");
+  Element ticks = panel.append("div");
+  ticks.attr("class", "ticks");
+  ticks.append("span").text("chill");
+  ticks.append("span").text("intense");
+  Element row = panel.append("div");
+  row.attr("class", "row");
+  Element play = row.append("button");
+  play.attr("id", "play");
+  play.text("▶ play");
+  Element volBox = row.append("label");
+  volBox.attr("class", "vol");
+  volBox.appendText("vol");
+  Element vol = volBox.append("input");
+  vol.attr("type", "range");
+  vol.attr("id", "vol");
+  vol.attr("min", "0");
+  vol.attr("max", "100");
+  vol.attr("value", "70");
+  vol.attr("aria-label", "Volume");
+  Element foot = mainEl.append("footer");
+  foot.appendText("space: play / pause · the dial takes the arrow keys · ");
+  Element src = foot.append("a");
+  src.attr("href", "https://github.com/botreevo/chipdial");
+  src.text("source");
+  foot.appendText(" — the synth, the screen and this page are all ");
+  Element wacLink = foot.append("a");
+  wacLink.attr("href", "https://github.com/voltrevo/wac");
+  wacLink.text("wac");
+
+  f64 start = dialFrom(page.location());
+  dial.attr("value", "\{(start * 1000.0) as~ i32}");
+  Song song = create(RATE as f64, CHUNK);
+  jump(song, start);
+  Vec<Voice> queued = Vec.create();
+  Vec<Snap> snaps = Vec.create();
+  App app = App(song, start, 0.49, false, null, 0.0, queued, snaps);
+  moodEl.text(mood(start));
+
+  dial.on("input", Listen.none(), (ElementEvent e) => {
+    app.target = (whole(e.value) as f64) / 1000.0;
+    page.go("t=\{whole(e.value)}", false);
+  });
+  vol.on("input", Listen.none(), (ElementEvent e) => {
+    f64 v = (whole(e.value) as f64) / 100.0;
+    app.volume = v * v;
+  });
+  fn<void()> toggle = () => {
+    if (app.playing) {
+      app.playing = false;
+      stopAll(app);
+      play.text("▶ play");
+    } else {
+      page.resumeAudio();
+      app.playing = true;
+      play.text("❚❚ pause");
+    }
+  };
+  play.on("click", Listen.none(), (ElementEvent e) => { toggle(); });
+  root.on("keydown", Listen.keys(" "), (ElementEvent e) => { if (e.value == " ") { toggle(); } });
+
+  u8[] px = u8[].filled(W * H * 4, 0 as u8);
+  Snap? shown = null;
+  string said = "";
+  string painted = "";
+  while (true) {
+    f64 now = await page.nextFrame();
+    if (app.playing) { topUp(page, app, now); }
+    // The newest snapshot whose chunk has begun to play; older ones go.
+    while (app.snaps.len() > 0 && app.snaps.get(0).at <= now) {
+      shown = app.snaps.get(0);
+      app.snaps.remove(0);
+    }
+    f64 t = shown is not null && app.playing ? shown!.t : app.target;
+    string m = mood(t);
+    if (m != said) { moodEl.text(m); said = m; }
+    // The page's accent follows the dial, as the screen does: set when it has moved enough to see.
+    i32[] c = accent(t);
+    string colour = "--accent: rgb(\{c[0]}, \{c[1]}, \{c[2]})";
+    if (colour != painted) { mainEl.attr("style", colour); painted = colour; }
+    draw(screen, app.playing ? shown : null, t, px);
+  }
+  return 0;
+}

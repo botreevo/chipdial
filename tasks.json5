@@ -1,0 +1,5 @@
+{
+  // The page, into docs/ — what GitHub Pages serves. The package cache needs web at the commit wac.lock pins.
+  build: "wac run --allow-read --allow-write --allow-run build.wac src/app.wac docs --title chipdial",
+  test: "wac test test",
+}

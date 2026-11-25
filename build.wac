@@ -1,0 +1,5 @@
+// Build the page: `wac run --allow-read --allow-write --allow-run build.wac src/app.wac docs --title chipdial`.
+import { Sys } from "std";
+import { buildPage } from "webbuild";
+
+export i32 main(Sys sys) { return buildPage(sys.args(), sys.stderr(), sys.stdout(), sys.files(), sys.procs()); }

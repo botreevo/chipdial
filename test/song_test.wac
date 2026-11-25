@@ -1,0 +1,75 @@
+// The song, rendered with no page: what `tools/render.mjs` measured when it was JavaScript, now asked of wac.
+//
+// Six seconds at each of six places on the dial. Each must be finite and never past full scale, and get louder as the
+// dial goes up — the rise a person hears as layers coming in, which a change to the mix could quietly undo.
+
+import { Song, create, jump, levels, render } from "../src/song.wac";
+
+struct Measured {
+  f64 peak;
+  f64 rms;
+  bool finite;
+}
+
+Measured measure(f64 t) {
+  i32 block = 4410;
+  Song s = create(44100.0, block);
+  jump(s, t);
+  f64 peak = 0.0;
+  f64 sum = 0.0;
+  bool finite = true;
+  i32 blocks = 60;
+  for (i32 b = 0; b < blocks; b++) {
+    render(s, t, block);
+    for (i32 i = 0; i < block; i++) {
+      f64 l = s.outL[i];
+      f64 r = s.outR[i];
+      if (l != l || r != r) { finite = false; }
+      if (l.abs() > peak) { peak = l.abs(); }
+      if (r.abs() > peak) { peak = r.abs(); }
+      sum = sum + l * l + r * r;
+    }
+  }
+  return Measured(peak, (sum / ((blocks * block * 2) as f64)).sqrt(), finite);
+}
+
+export string test_the_song_is_finite_under_full_scale_and_louder_as_the_dial_rises() {
+  f64[] dial = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0];
+  string bad = "";
+  f64 quiet = 0.0;
+  for (i32 i = 0; i < dial.len(); i++) {
+    Measured m = measure(dial[i]);
+    if (!m.finite) { bad = bad + " t=\{dial[i]} is not finite;"; }
+    if (m.peak >= 1.0) { bad = bad + " t=\{dial[i]} peaks at \{m.peak};"; }
+    if (m.rms < 0.03) { bad = bad + " t=\{dial[i]} is near silent (rms \{m.rms});"; }
+    if (i == 0) { quiet = m.rms; }
+    if (i == dial.len() - 1 && !(m.rms > quiet * 1.5)) { bad = bad + " full intensity (rms \{m.rms}) is not much louder than none (\{quiet});"; }
+  }
+  return bad;
+}
+
+export string test_the_layers_come_in_as_the_dial_rises() {
+  // At no intensity only the pad plays; at full, every layer has been heard within a couple of bars.
+  string bad = "";
+  f64[] lv = f64[].filled(7, 0.0);
+  Song calm = create(44100.0, 4410);
+  jump(calm, 0.0);
+  f64[] most = f64[].filled(7, 0.0);
+  for (i32 b = 0; b < 40; b++) {
+    render(calm, 0.0, 4410);
+    levels(calm, lv);
+    for (i32 k = 0; k < 7; k++) { if (lv[k] > most[k]) { most[k] = lv[k]; } }
+  }
+  if (!(most[0] > 0.9)) { bad = bad + " the pad is not there at rest;"; }
+  for (i32 k = 1; k < 7; k++) { if (most[k] > 0.001) { bad = bad + " layer \{k} plays at rest (\{most[k]});"; } }
+  Song hot = create(44100.0, 4410);
+  jump(hot, 1.0);
+  f64[] loud = f64[].filled(7, 0.0);
+  for (i32 b = 0; b < 40; b++) {
+    render(hot, 1.0, 4410);
+    levels(hot, lv);
+    for (i32 k = 0; k < 7; k++) { if (lv[k] > loud[k]) { loud[k] = lv[k]; } }
+  }
+  for (i32 k = 1; k < 7; k++) { if (!(loud[k] > 0.3)) { bad = bad + " layer \{k} is not heard at full intensity (\{loud[k]});"; } }
+  return bad;
+}

@@ -1,0 +1,6 @@
+{
+  "imports": {
+    "web": { "git": "https://github.com/voltrevo/wac.git", "ref": "abc72814ab2395c10690071e4dcca77534566247", "subdir": "./projects/web", "commit": "abc72814ab2395c10690071e4dcca77534566247" },
+    "webbuild": { "git": "https://github.com/voltrevo/wac.git", "ref": "abc72814ab2395c10690071e4dcca77534566247", "subdir": "./projects/web/tools", "commit": "abc72814ab2395c10690071e4dcca77534566247" }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  // web, the page a wac program is handed, and its builder: projects/web of wac's repository, at the commit that
+  // added sound made as it is heard (stereo, Sound.playAfter, Sound.forget — voltrevo/wac#41).
+  imports: {
+    web: { git: 'https://github.com/voltrevo/wac.git', ref: 'abc72814ab2395c10690071e4dcca77534566247', subdir: './projects/web' },
+    webbuild: { git: 'https://github.com/voltrevo/wac.git', ref: 'abc72814ab2395c10690071e4dcca77534566247', subdir: './projects/web/tools' },
+  },
+}

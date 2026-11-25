@@ -1,0 +1,20 @@
+// Written by web's tools/build.wac — the page's program, as a module any host that provides `wac.page` runs.
+import { main as program } from "../src/app.wac";
+import { Page } from "web";
+import { Sys } from "std";
+
+export async i32 main(Sys sys) {
+  match (await Page.open(sys)) {
+    Ok(page): { return await run(page); }
+    Err(why): {
+      sys.stderr().line("this is a page, and its host has none: " + why);
+      return 1;
+    }
+  }
+}
+
+async i32 run(Page page) {
+  program(page);
+  await page.keepRendering();
+  return 0;
+}
